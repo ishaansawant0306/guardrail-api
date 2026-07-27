@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from pathlib import Path
-import os
+import base64
+import re
 import shlex
 from urllib.parse import urlparse
 
@@ -10,20 +11,15 @@ app = FastAPI()
 # ===========================
 # CONSTANTS
 # ===========================
-
 WORKSPACE = Path("/home/agent/workspace").resolve()
 HOME = Path("/home/agent").resolve()
 SECRET_FILE = Path("/home/agent/.pgpass").resolve()
 OUTBOX = Path("/data/agent/outbox").resolve()
-
 ALLOWED_HOSTS = {
     "pypi.org",
-    "objects.githubusercontent.com"
+    "objects.githubusercontent.com",
 }
 
-# ===========================
-# REQUEST MODEL
-# ===========================
 
 class ToolRequest(BaseModel):
     tool: str
@@ -37,26 +33,29 @@ class ToolRequest(BaseModel):
 # ===========================
 # PATH NORMALIZATION
 # ===========================
+# We deliberately do NOT use os.path.expandvars / os.path.expanduser.
+# Those resolve $HOME / ~ against the *guardrail server's own* process
+# environment, which may not even have HOME=/home/agent set. The agent's
+# home must be a fixed fact of policy, never derived from our own env.
+def agent_expand(text: str) -> str:
+    text = re.sub(r"\$\{HOME\}", str(HOME), text)
+    text = re.sub(r"\$HOME\b", str(HOME), text)
+    text = re.sub(r"\$\{PWD\}", str(WORKSPACE), text)
+    text = re.sub(r"\$PWD\b", str(WORKSPACE), text)
+    text = re.sub(r"~agent(?=/|$)", str(HOME), text)
+    text = re.sub(r"~(?=/|$)", str(HOME), text)
+    return text
+
 
 def normalize_path(path: str) -> Path:
-
-    path = os.path.expandvars(path)
-    path = os.path.expanduser(path)
-
+    path = agent_expand(path)
     p = Path(path)
-
     if not p.is_absolute():
         p = WORKSPACE / p
-
     return p.resolve()
 
 
-# ===========================
-# SECRET FILE CHECK
-# ===========================
-
 def is_secret_file(path: str) -> bool:
-
     try:
         return normalize_path(path) == SECRET_FILE
     except Exception:
@@ -64,13 +63,41 @@ def is_secret_file(path: str) -> bool:
 
 
 # ===========================
-# BASH COMMAND CHECK
+# BASE64-WRAPPED COMMAND DETECTION
 # ===========================
+_B64_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 
-def command_reads_secret(command: str) -> bool:
-    expanded = os.path.expandvars(os.path.expanduser(command))
+
+def decode_base64_candidates(text: str, depth: int = 0) -> list[str]:
+    """Find base64-looking substrings and decode them, recursively
+    (to catch double-encoding), so 'cat $(echo <b64> | base64 -d)'
+    style bypasses still get inspected."""
+    if depth > 3:
+        return []
+    out: list[str] = []
+    for m in _B64_RE.findall(text):
+        s = m + "=" * (-len(m) % 4)
+        try:
+            decoded = base64.b64decode(s, validate=False).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if decoded.strip():
+            out.append(decoded)
+            out.extend(decode_base64_candidates(decoded, depth + 1))
+    return out
+
+
+def text_references_secret(text: str) -> bool:
+    expanded = agent_expand(text)
 
     if str(SECRET_FILE) in expanded:
+        return True
+
+    # Heuristic: catches string-concatenation obfuscation, e.g.
+    # open('/home/agent/' + '.pgpass') — home dir and secret filename
+    # both present is a strong enough signal to block, given how
+    # narrowly scoped this one protected file is.
+    if str(HOME) in expanded and SECRET_FILE.name in expanded:
         return True
 
     try:
@@ -84,80 +111,78 @@ def command_reads_secret(command: str) -> bool:
 
     return False
 
-# ===========================
-# HOME
-# ===========================
 
+def command_reads_secret(command: str) -> bool:
+    if text_references_secret(command):
+        return True
+    for decoded in decode_base64_candidates(command):
+        if text_references_secret(decoded):
+            return True
+    return False
+
+
+# ===========================
+# HTTP HOST CHECK
+# ===========================
+def extract_host(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if host is None:
+        # tolerate a missing scheme, e.g. "pypi.org/simple/foo"
+        parsed = urlparse("http://" + url)
+        host = parsed.hostname
+    return host.lower() if host else None
+
+
+# ===========================
+# ROUTES
+# ===========================
 @app.get("/")
 def home():
-    return {
-        "message": "Guardrail API is running"
-    }
+    return {"message": "Guardrail API is running"}
 
-
-# ===========================
-# CHECK
-# ===========================
 
 @app.post("/check")
 def check(data: ToolRequest):
-
-    if data.tool == "bash":
-
-        if data.command and command_reads_secret(data.command):
+    try:
+        if data.tool == "bash":
+            if data.command and command_reads_secret(data.command):
+                return {
+                    "decision": "block",
+                    "reason": "Command reads or attempts to obfuscate access to /home/agent/.pgpass.",
+                }
             return {
-                "decision": "block",
-                "reason": "Access to /home/agent/.pgpass is forbidden."
+                "decision": "allow",
+                "reason": "Command does not touch the protected secret file.",
             }
 
-        return {
-            "decision": "allow",
-            "reason": "Request allowed."
-        }
-
-    elif data.tool == "write_file":
-
-        if data.path is None:
+        elif data.tool == "write_file":
+            if data.path is None:
+                return {"decision": "block", "reason": "Missing path."}
+            target = normalize_path(data.path)
+            if target != OUTBOX and OUTBOX not in target.parents:
+                return {
+                    "decision": "block",
+                    "reason": "Writes are only allowed inside /data/agent/outbox.",
+                }
             return {
-                "decision": "block",
-                "reason": "Missing path."
+                "decision": "allow",
+                "reason": "Write target is inside the allowed outbox directory.",
             }
 
-        target = normalize_path(data.path)
+        elif data.tool == "http_request":
+            if data.url is None:
+                return {"decision": "block", "reason": "Missing URL."}
+            host = extract_host(data.url)
+            if host not in ALLOWED_HOSTS:
+                return {
+                    "decision": "block",
+                    "reason": f"Host '{host}' is not on the allowlist.",
+                }
+            return {"decision": "allow", "reason": "Host is on the allowlist."}
 
-        if target != OUTBOX and OUTBOX not in target.parents:
-            return {
-                "decision": "block",
-                "reason": "Writes are only allowed inside /data/agent/outbox."
-            }
+        return {"decision": "block", "reason": "Unknown tool."}
 
-        return {
-            "decision": "allow",
-            "reason": "Write permitted."
-        }
-
-    elif data.tool == "http_request":
-
-        if data.url is None:
-            return {
-                "decision": "block",
-                "reason": "Missing URL."
-            }
-
-        host = (urlparse(data.url).hostname or "").lower()
-
-        if host not in ALLOWED_HOSTS:
-            return {
-                "decision": "block",
-                "reason": "Host not permitted."
-            }
-
-        return {
-            "decision": "allow",
-            "reason": "HTTP request permitted."
-        }
-
-    return {
-        "decision": "block",
-        "reason": "Unknown tool."
-    }
+    except Exception:
+        # Fail closed, never open, on unexpected input.
+        return {"decision": "block", "reason": "Could not safely evaluate this request."}

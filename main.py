@@ -1,16 +1,28 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 app = FastAPI()
 
+
+class ToolRequest(BaseModel):
+    tool: str
+    command: str | None = None
+    path: str | None = None
+    content: str | None = None
+    method: str | None = None
+    url: str | None = None
+
+
 @app.get("/")
 def home():
-    return {"message": "Guardrail API is running"}
+    return {
+        "message": "Guardrail API is running"
+    }
+
 
 @app.post("/check")
-async def check(request: Request):
-    data = await request.json()
-
+def check(data: ToolRequest):
     return {
         "decision": "allow",
-        "reason": f"Received tool: {data.get('tool')}"
+        "reason": f"Received tool: {data.tool}"
     }

@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 app = FastAPI()
 
@@ -7,8 +7,10 @@ def home():
     return {"message": "Guardrail API is running"}
 
 @app.post("/check")
-def check():
+async def check(request: Request):
+    data = await request.json()
+
     return {
         "decision": "allow",
-        "reason": "Test endpoint working"
+        "reason": f"Received tool: {data.get('tool')}"
     }
